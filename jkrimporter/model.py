@@ -83,7 +83,7 @@ class Jatelaji(str, Enum):
     sekajate = "Sekajäte"
     bio = "Biojäte"
     lasi = "Lasi"
-    peperi = "Paperi"
+    paperi = "Paperi"
     kartonki = "Kartonki"
     muovi = "Muovi"
     metalli = "Metalli"
@@ -137,7 +137,8 @@ class Tyhjennysvali(NamedTuple):
 @dataclass
 class Tyhjennystapahtuma:
     jatelaji: Jatelaji
-    pvm: Optional[date]
+    alkupvm: Optional[date]
+    loppupvm: Optional[date]
     tyhjennyskerrat: int
     tilavuus: Optional[int]
     massa: Optional[int] = None
@@ -166,7 +167,7 @@ class TyhjennysSopimus(BaseSopimus):
 
 
 @dataclass
-class KimppaSopimus(BaseSopimus):
+class KimppaSopimus(TyhjennysSopimus):
     isannan_asiakasnumero: Optional[Tunnus] = None
 
 
@@ -204,6 +205,9 @@ class Toimitus:
 
 @dataclass
 class JkrData:
+    # The dates may be empty. This means that the total time span of the imported data
+    # is unknown. Each asiakastieto may have different start and end dates, when
+    # importing combined client data in a batch.
     alkupvm: Optional[date] = None
     loppupvm: Optional[date] = None
     asiakkaat: Dict[Tunnus, Asiakas] = field(default_factory=dict)

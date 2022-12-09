@@ -90,7 +90,13 @@ def create_or_update_sopimus(
             )
     else:
         kimppaisanta = None
+    print('got jkr sopimus')
+    print(jkr_sopimus)
 
+    # TODO: potentially we have to separate sopimukset for the same
+    # jatetyyppi even if they overlap. So we might need to check a
+    # separate field, i.e. the sopimus id or the customer id, to make
+    # sure that we are combining the right sopimus, not different ones?
     db_sopimus = next(
         (
             sopimus
@@ -103,8 +109,11 @@ def create_or_update_sopimus(
         None,
     )
     if db_sopimus:
+        print('found db sopimus')
+        print(db_sopimus)
         merge_alkupvm(db_sopimus, jkr_sopimus)
         merge_loppupvm(db_sopimus, jkr_sopimus)
+        print('updated sopimus')
     else:
         db_sopimus = Sopimus(
             kohde=kohde,
@@ -116,6 +125,7 @@ def create_or_update_sopimus(
             kimppaisanta_kohde=kimppaisanta,
         )
         session.add(db_sopimus)
+        print("created new sopimus")
 
     return db_sopimus
 
@@ -148,6 +158,9 @@ def update_keraysvalineet(
     keraysvalineet: "List[JkrKeraysvaline]",
     raportointi_loppupvm: datetime.date,
 ):
+    print("updating keraysvaline")
+    print(keraysvalineet)
+    print(raportointi_loppupvm)
     for keraysvaline in keraysvalineet:
         db_keraysvaline = next(
             (
@@ -159,8 +172,10 @@ def update_keraysvalineet(
             None,
         )
         if db_keraysvaline:
+            print("väline in db")
             db_keraysvaline.pvm = raportointi_loppupvm
         else:
+            print("creating new väline")
             db_keraysvaline = Keraysvaline(
                 pvm=raportointi_loppupvm,
                 tilavuus=keraysvaline.tilavuus,
@@ -194,6 +209,8 @@ def update_tyhjennysvalit(
                 session.delete(db_tyhjennysvali)
 
     for jkr_tyhjennysvali in sopimus.tyhjennysvalit:
+        print('got tyhjennysväli')
+        print(jkr_tyhjennysvali)
         exists = any(
             db_tyhjennysvali.alkuvko == jkr_tyhjennysvali.alkuvko
             and db_tyhjennysvali.loppuvko == jkr_tyhjennysvali.loppuvko
@@ -212,19 +229,26 @@ def update_tyhjennysvalit(
 
 def update_sopimukset_for_kohde(
     session,
-    asiakas: "Asiakas",
     kohde,
-    sopimukset: "List[Union[TyhjennysSopimus, KimppaSopimus]]",
-    urakoitsija: Tiedontuottaja,
+    asiakas: "Asiakas",
+    # sopimukset: "List[Union[TyhjennysSopimus, KimppaSopimus]]",
     raportointi_loppupvm,
+    urakoitsija: Tiedontuottaja,
 ):
-    for sopimus in sopimukset:
+    for sopimus in asiakas.sopimukset:
         db_sopimus = create_or_update_sopimus(session, kohde, urakoitsija, sopimus)
         if db_sopimus:
             update_kesteytykset(db_sopimus, sopimus.keskeytykset)
 
-            if not isinstance(sopimus, KimppaSopimus):
-                update_keraysvalineet(
-                    db_sopimus, sopimus.keraysvalineet, raportointi_loppupvm
-                )
-                update_tyhjennysvalit(session, asiakas, db_sopimus, sopimus)
+            # Why wouldn't we save the data on each sopimus? Yeah it is duplicated.
+            # But it is there in the data already, and the qgis users wants to
+            # see the data in the form.
+            # if not isinstance(sopimus, KimppaSopimus):
+            update_keraysvalineet(
+                db_sopimus,
+                sopimus.keraysvalineet,
+                raportointi_loppupvm
+                if raportointi_loppupvm
+                else asiakas.voimassa.upper,
+            )
+            update_tyhjennysvalit(session, asiakas, db_sopimus, sopimus)

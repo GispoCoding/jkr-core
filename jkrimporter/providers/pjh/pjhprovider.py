@@ -218,7 +218,7 @@ class PjhTranslator:
 
             tyhjennystapahtuma = JkrTyhjennystapahtuma(
                 jatelaji=jatelaji,
-                pvm=row.pvm,
+                loppupvm=row.pvm,
                 tyhjennyskerrat=row.tyhjennyskerrat,
                 massa=row.massa,
                 tilavuus=row.tilavuus,

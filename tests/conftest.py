@@ -16,8 +16,12 @@ def datadir(tmpdir, request):
     testdir = testfilepath.parent
     testfilename = testfilepath.stem
 
-    datadir = testdir / "data" / testfilename
+    # use local data dir until we get anonymized test fixtures to use
+    datadir = testdir.parent / "data" / testfilename
     if os.path.isdir(datadir):
         copytree(datadir, tmpdir, dirs_exist_ok=True)
+    print(datadir)
+    print(tmpdir)
+    print(os.listdir(tmpdir))
 
     return tmpdir

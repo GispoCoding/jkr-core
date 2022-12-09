@@ -29,3 +29,10 @@ def remove_tiedontuottaja(tunnus: str):
         tiedontuottaja = session.get(Tiedontuottaja, tunnus)
         session.delete(tiedontuottaja)
         session.commit()
+
+
+def rename_tiedontuottaja(tunnus: str, nimi: str):
+    with Session(engine) as session:
+        tiedontuottaja = session.get(Tiedontuottaja, tunnus)
+        tiedontuottaja.nimi = nimi
+        session.commit()

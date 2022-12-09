@@ -2,9 +2,9 @@ import csv
 from abc import ABC, ABCMeta, abstractmethod
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Generic, Iterator, List, Set, TypeVar
-from pydantic import ValidationError
 
 from openpyxl.reader.excel import load_workbook
+from pydantic import ValidationError
 
 if TYPE_CHECKING:
     from typing import Iterable, Protocol
@@ -43,6 +43,20 @@ class ExcelSheet:
             yield dict(zip(self.headers, row))
 
 
+class CombinedExcelSheet:
+    def __init__(self, workbooks: Set["Workbook"], key: str = None):
+        if key:
+            self.sheets = [ExcelSheet(workbook[key]) for workbook in workbooks]
+        else:
+            self.sheets = [ExcelSheet(workbook.active) for workbook in workbooks]
+        self.headers = self.sheets[0].headers
+
+    def __iter__(self) -> Iterator[Dict[str, Any]]:
+        for sheet in self.sheets:
+            rows = iter(sheet)
+            yield from rows
+
+
 class SheetCollection(ABC):
     def __init__(self, path):
         self._path = Path(path)
@@ -75,6 +89,9 @@ class CsvSheetCollection(SheetCollection):
 
 
 class ExcelFileSheetCollection(SheetCollection):
+    """
+    Allows reading different worksheets from different files.
+    """
     def __init__(self, path):
         super().__init__(path)
         self._opened_workbooks: Set["Workbook"] = set()
@@ -92,6 +109,24 @@ class ExcelFileSheetCollection(SheetCollection):
             workbook.close()
 
         super().__del__()
+
+
+class ExcelCombinedFileSheetCollection(ExcelFileSheetCollection):
+    """
+    Allows iterating through a list of xlsx files. Combine active worksheets from all
+    files to the same object.
+    """
+
+    def __init__(self, path):
+        super().__init__(path)
+        for f in self._path.iterdir():
+            # do not read any extra files, such as any error csvs present
+            if f.suffix == ".xlsx":
+                workbook = load_workbook(filename=f, data_only=True, read_only=True)
+                self._opened_workbooks.add(workbook)
+
+    def _open_sheet(self, key: str = None):
+        return CombinedExcelSheet(self._opened_workbooks, key)
 
 
 class ExcelSheetCollection(SheetCollection):
@@ -112,11 +147,12 @@ T = TypeVar("T")
 
 
 class SiirtotiedostoSheet(Generic[T], metaclass=ABCMeta):
-    def __init__(self, sheet_collection: SheetCollection, sheet_name: str):
+    def __init__(self, sheet_collection: SheetCollection, sheet_name: str = None):
         self._sheet = sheet_collection._open_sheet(sheet_name)
         self._error_sheet = sheet_collection._open_error_sheet(
             sheet_name, self._sheet.headers
         )
+        self.headers = self._sheet.headers
 
     @abstractmethod
     def _obj_from_dict(data) -> T:

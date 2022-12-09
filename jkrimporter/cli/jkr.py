@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -10,9 +11,29 @@ from jkrimporter.providers.db.services.tiedontuottaja import (
     insert_tiedontuottaja,
     list_tiedontuottajat,
     remove_tiedontuottaja,
+    rename_tiedontuottaja
  )
 from jkrimporter.providers.pjh.pjhprovider import PjhTranslator
 from jkrimporter.providers.pjh.siirtotiedosto import PjhSiirtotiedosto
+from jkrimporter.providers.nokia.nokiaprovider import NokiaTranslator
+from jkrimporter.providers.nokia.siirtotiedosto import NokiaSiirtotiedosto
+from jkrimporter.providers.lahti.lahtiprovider import LahtiTranslator
+from jkrimporter.providers.lahti.siirtotiedosto import LahtiSiirtotiedosto
+from jkrimporter.utils.date import parse_date_string
+
+
+@dataclass
+class Provider:
+    Translator: type
+    Siirtotiedosto: type
+
+
+PROVIDERS = {
+    # we may also add other providers using the *same* formats
+    "PJH": Provider(Translator=PjhTranslator, Siirtotiedosto=PjhSiirtotiedosto),
+    "HKO": Provider(Translator=NokiaTranslator, Siirtotiedosto=NokiaSiirtotiedosto),
+    "LSJ": Provider(Translator=LahtiTranslator, Siirtotiedosto=LahtiSiirtotiedosto)
+}
 
 
 def version_callback(value: bool):
@@ -35,17 +56,22 @@ def main_callback(
 
 app = typer.Typer(callback=main_callback)
 
-urakoitsija_app = typer.Typer()
+provider_app = typer.Typer()
 app.add_typer(
-    urakoitsija_app, name="urakoitsija", help="Muokkaa ja tarkastele urakoitsijoita."
+    provider_app, name="tiedontuottaja", help="Muokkaa ja tarkastele tiedontuottajia."
 )
 
 
 @app.command("import", help="Import transportation data to JKR.")
 def import_data(
     siirtotiedosto: Path = typer.Argument(..., help="Siirtotiedoston kansio"),
-    urakoitsija: str = typer.Argument(
+    tiedontuottajatunnus: str = typer.Argument(
         ..., help="Tiedon toimittajan tunnus. Esim. 'PJH', 'HKO', 'LSJ'"
+    ),
+    ala_luo: bool = typer.Option(
+        False,
+        "--ala_luo",
+        help="Älä luo uusia kohteita tästä datasta."
     ),
     ala_paivita: bool = typer.Option(
         False,
@@ -55,50 +81,78 @@ def import_data(
     alkupvm: str = typer.Argument(None, help="Importoitavan datan alkupvm"),
     loppupvm: str = typer.Argument(None, help="Importoitavan datan loppupvm"),
 ):
-    tiedontuottaja = get_tiedontuottaja(urakoitsija)
+    tiedontuottaja = get_tiedontuottaja(tiedontuottajatunnus)
     if not tiedontuottaja:
         typer.echo(
-            f"Urakoitsijaa {urakoitsija} ei löydy järjestelmästä. Lisää komennolla `jkr urakoitsija add`"
+            f"Tiedontuottajaa {tiedontuottaja} ei löydy järjestelmästä. Lisää komennolla `jkr tiedontuottaja add`"
         )
         raise typer.Exit()
-    pjhdata = PjhSiirtotiedosto(siirtotiedosto)
-    translator = PjhTranslator(pjhdata)
-    jkr_data = translator.as_jkr_data()
+    provider = PROVIDERS[tiedontuottajatunnus]
+    data = provider.Siirtotiedosto(siirtotiedosto)
+
+    if alkupvm:
+        alkupvm = parse_date_string(alkupvm)
+    if loppupvm:
+        alkupvm = parse_date_string(loppupvm)
+    if tiedontuottajatunnus == "HKO":
+        ala_paivita = True
+        if not alkupvm or not loppupvm:
+            typer.echo("Nokian importin yhteydessä päivämäärät ovat pakolliset")
+            raise typer.Exit()
+
+    translator = provider.Translator(data, tiedontuottajatunnus)
+    jkr_data = translator.as_jkr_data(alkupvm, loppupvm)
+    print('writing to db...')
     db = DbProvider()
-    db.write(jkr_data, urakoitsija, ala_paivita)
+    db.write(jkr_data, tiedontuottajatunnus, ala_luo, ala_paivita)
 
     print("VALMIS!")
 
 
 @app.command("create_dvv_kohteet", help="Create kohteet from DVV data in database.")
 def create_dvv_kohteet(
+    alkupvm: Optional[str] = typer.Argument(None, help="Importoitavan datan alkupvm"),
+    loppupvm: Optional[str] = typer.Argument(None, help="Importoitavan datan loppupvm"),
     perusmaksutiedosto: Optional[Path] = typer.Argument(
         None, help="Perusmaksurekisteritiedosto"
     ),
 ):
     db = DbProvider()
-    db.write_dvv_kohteet(perusmaksutiedosto)
+    # support all combinations of known and unknown alku- and loppupvm
+    if alkupvm == "None":
+        alkupvm = None
+    if loppupvm == "None":
+        loppupvm = None
+    db.write_dvv_kohteet(alkupvm, loppupvm, perusmaksutiedosto)
 
     print("VALMIS!")
 
 
-@urakoitsija_app.command("add", help="Lisää uusi urakoitsija järjestelmään.")
-def urakoitsija_add_new(
-    tunnus: str = typer.Argument(..., help="Urakoitsijan tunnus. Esim. 'PJH'"),
-    name: str = typer.Argument(..., help="Urakoitsijan nimi."),
+@provider_app.command("add", help="Lisää uusi tiedontuottaja järjestelmään.")
+def tiedontuottaja_add_new(
+    tunnus: str = typer.Argument(..., help="Tiedontuottajan tunnus. Esim. 'PJH'"),
+    name: str = typer.Argument(..., help="Tiedontuottajan nimi."),
 ):
     insert_tiedontuottaja(tunnus.upper(), name)
 
 
-@urakoitsija_app.command("remove", help="Poista urakoitsija järjestelmästä.")
-def urakoitsija_remove(
-    tunnus: str = typer.Argument(..., help="Urakoitsijan tunnus. Esim. 'PJH'")
+@provider_app.command("rename", help="Muuta tiedontuottajan nimi järjestelmässä.")
+def tiedontuottaja_rename(
+    tunnus: str = typer.Argument(..., help="Tiedontuottajan tunnus. Esim. 'PJH'"),
+    name: str = typer.Argument(..., help="Tiedontuottajan uusi nimi."),
+):
+    rename_tiedontuottaja(tunnus.upper(), name)
+
+
+@provider_app.command("remove", help="Poista tiedontuottaja järjestelmästä.")
+def tiedontuottaja_remove(
+    tunnus: str = typer.Argument(..., help="Tiedontuottajan tunnus. Esim. 'PJH'")
 ):
     remove_tiedontuottaja(tunnus.upper())
 
 
-@urakoitsija_app.command("list", help="Listaa järjestelmästä löytyvät urakoitsijat.")
-def urakoitsija_list():
+@provider_app.command("list", help="Listaa järjestelmästä löytyvät tiedontuottajat.")
+def tiedontuottaja_list():
     for tiedontuottaja in list_tiedontuottajat():
         print(f"{tiedontuottaja.tunnus}\t{tiedontuottaja.nimi}")
 

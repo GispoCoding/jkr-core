@@ -22,6 +22,7 @@ asoy_strings = (
     "asoy",
     "as oy",
     "asunto-osakeyhtiö",
+    "asunto-oy",
     "asunto oy",
     "bostadsaktiebolag",
     "bostads ab",

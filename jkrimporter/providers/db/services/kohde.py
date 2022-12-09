@@ -1,33 +1,26 @@
 import datetime
+import re
 from collections import defaultdict
-from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
 from openpyxl import load_workbook
 from psycopg2.extras import DateRange
-from sqlalchemy import and_
+from sqlalchemy import and_, exists
 from sqlalchemy import func as sqlalchemyFunc
 from sqlalchemy import or_, select
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.orm.decl_api import DeclarativeMeta
-from sqlalchemy.sql import text
 
 from jkrimporter.model import Yhteystieto
 
 from .. import codes
-from ..codes import (
-    KohdeTyyppi,
-    OsapuolenrooliTyyppi,
-    RakennuksenKayttotarkoitusTyyppi,
-    RakennuksenOlotilaTyyppi,
-)
+from ..codes import KohdeTyyppi, OsapuolenrooliTyyppi, RakennuksenKayttotarkoitusTyyppi
 from ..models import (
     Katu,
     Kohde,
     KohteenOsapuolet,
     KohteenRakennukset,
-    Kunta,
     Osapuoli,
     Osoite,
     RakennuksenOmistajat,
@@ -35,11 +28,11 @@ from ..models import (
     Rakennus,
     UlkoinenAsiakastieto,
 )
-from ..utils import form_display_name, is_asoy, is_company, is_yhteiso
+from ..utils import clean_asoy_name, form_display_name, is_asoy, is_company, is_yhteiso
 
 if TYPE_CHECKING:
     from pathlib import Path
-    from typing import Dict, FrozenSet, List, Set, Tuple, Union
+    from typing import Dict, FrozenSet, List, Optional, Set, Tuple, Union
 
     from sqlalchemy.orm import Session
     from sqlalchemy.sql.selectable import Select
@@ -49,27 +42,32 @@ if TYPE_CHECKING:
     Rakennustiedot = Tuple[Rakennus, FrozenSet[Osapuoli], FrozenSet[Osoite]]
 
 
-# @dataclass
-# class Rakennustiedot:
-#     rakennus: Rakennus
-#     osapuolet: FrozenSet[Osapuoli]
-#     osoitteet: FrozenSet[Osoite]
+separators = [r"\s\&\s", r"\sja\s"]
+separator_regex = r"|".join(separators)
+
+
+def match_name(first: str, second: str) -> bool:
+    """
+    Returns true if one name is subset of the other, i.e. the same name without extra
+    parts. Consider typical separators combining names.
+    """
+    first = re.split(separator_regex, first)
+    second = re.split(separator_regex, second)
+    if len(first) > 1 or len(second) > 1:
+        # TODO: if names have common surname, paste it to the name that is missing
+        # surname. Will take some detective work tho.
+        return any(
+            match_name(first_name, second_name)
+            for first_name in first
+            for second_name in second
+        )
+    first_parts = set(first[0].lower().split())
+    second_parts = set(second[0].lower().split())
+    return first_parts.issubset(second_parts) or second_parts.issubset(first_parts)
 
 
 def is_aluekerays(asiakas: "Asiakas") -> bool:
     return "aluejätepiste" in asiakas.haltija.nimi.lower()
-
-
-def find_kohde(session: "Session", asiakas: "Asiakas") -> "Union[Kohde, None]":
-    kohde = get_kohde_by_asiakasnumero(session, asiakas.asiakasnumero)
-    if kohde:
-        return kohde
-
-    # kohde = get_kohde_by_address(session, asiakas)
-    # if kohde:
-    #     return kohde
-
-    return None
 
 
 def get_ulkoinen_asiakastieto(
@@ -85,68 +83,104 @@ def get_ulkoinen_asiakastieto(
         return None
 
 
-def find_or_create_asiakastieto(
-    session: "Session", asiakas: "Asiakas"
-) -> UlkoinenAsiakastieto:
-    tunnus = asiakas.asiakasnumero
-
-    query = select(UlkoinenAsiakastieto).where(
-        UlkoinenAsiakastieto.tiedontuottaja_tunnus == tunnus.jarjestelma,
-        UlkoinenAsiakastieto.ulkoinen_id == tunnus.tunnus,
-    )
-    try:
-        db_asiakastieto = session.execute(query).scalar_one()
-    except NoResultFound:
-        db_asiakastieto = UlkoinenAsiakastieto(
-            tiedontuottaja_tunnus=tunnus.jarjestelma, ulkoinen_id=tunnus.tunnus
-        )
-
-    return db_asiakastieto
-
-
 def update_ulkoinen_asiakastieto(ulkoinen_asiakastieto, asiakas: "Asiakas"):
     if ulkoinen_asiakastieto.ulkoinen_asiakastieto != asiakas.ulkoinen_asiakastieto:
         ulkoinen_asiakastieto.ulkoinen_asiakastieto = asiakas.ulkoinen_asiakastieto
 
 
-def find_kohde_by_asiakastiedot(
-    session: "Session", asiakas: "Asiakas"
-) -> "Union[Kohde, None]":
-
-    ulkoinen_asiakastieto_exists = (
-        select(1)
-        .where(
-            UlkoinenAsiakastieto.kohde_id == Kohde.id,
-            UlkoinenAsiakastieto.tiedontuottaja_tunnus
-            == asiakas.asiakasnumero.jarjestelma,
-        )
-        .exists()
+def find_kohde_by_prt(session: "Session", asiakas: "Asiakas") -> "Union[Kohde, None]":
+    print(f"asiakas has prts {asiakas.rakennukset}")
+    return _find_kohde_by_asiakastiedot(
+        session, Rakennus.prt.in_(asiakas.rakennukset), asiakas
     )
 
-    filters = []
-    if (
-        asiakas.haltija.osoite.postitoimipaikka
-        and asiakas.haltija.osoite.katunimi
-        and asiakas.haltija.osoite.osoitenumero
-    ):
-        filters.append(
-            and_(
-                sqlalchemyFunc.lower(Kunta.nimi_fi)
-                == asiakas.haltija.osoite.postitoimipaikka.lower(),  # TODO: korjaa kunta <> postitoimipaikka
-                or_(
-                    sqlalchemyFunc.lower(Katu.katunimi_fi)
-                    == asiakas.haltija.osoite.katunimi.lower(),
-                    sqlalchemyFunc.lower(Katu.katunimi_sv)
-                    == asiakas.haltija.osoite.katunimi.lower(),
-                ),
-                Osoite.osoitenumero == asiakas.haltija.osoite.osoitenumero,
-            )
-        )
-    if asiakas.rakennukset:
-        filters.append(Rakennus.prt.in_(asiakas.rakennukset))
-    if asiakas.kiinteistot:
-        filters.append(Rakennus.kiinteistotunnus.in_(asiakas.kiinteistot))
 
+def find_kohde_by_kiinteisto(
+    session: "Session", asiakas: "Asiakas"
+) -> "Union[Kohde, None]":
+    print(f"asiakas has kiinteistöt {asiakas.kiinteistot}")
+    return _find_kohde_by_asiakastiedot(
+        session, Rakennus.kiinteistotunnus.in_(asiakas.kiinteistot), asiakas
+    )
+
+
+def find_kohde_by_address(
+    session: "Session", asiakas: "Asiakas"
+) -> "Union[Kohde, None]":
+    print("matching by address:")
+    # The osoitenumero may contain dash. In that case, the buildings may be
+    # listed as separate in DVV data.
+    if (
+        asiakas.haltija.osoite.osoitenumero
+        and "-" in asiakas.haltija.osoite.osoitenumero
+    ):
+        osoitenumerot = asiakas.haltija.osoite.osoitenumero.split("-", maxsplit=1)
+    else:
+        osoitenumerot = [asiakas.haltija.osoite.osoitenumero]
+
+    print(osoitenumerot)
+    # The address parser parses Metsätie 33 A so that 33 is osoitenumero and A is
+    # huoneistotunnus. While the parsing is correct, it may very well also mean (and
+    # in many cases it means) osoitenumero 33a and empty huoneistonumero.
+    potential_osoitenumero_suffix = (
+        asiakas.haltija.osoite.huoneistotunnus.lower()
+        if asiakas.haltija.osoite.huoneistotunnus
+        else ""
+    )
+    if potential_osoitenumero_suffix:
+        osoitenumerot_with_suffix = [
+            osoitenumero + potential_osoitenumero_suffix
+            for osoitenumero in osoitenumerot
+        ]
+    else:
+        osoitenumerot_with_suffix = []
+    print(osoitenumerot_with_suffix)
+
+    # - Do *NOT* find Sokeritopankatu 18 *AND* Sokeritopankatu 18a by
+    # Sokeritopankatu 18 A. Looks like Sokeritopankatu 18, 18 A and 18 B are *all*
+    # separate.
+    # - Do *NOT* find Mukkulankatu 51 *AND* Mukkulankatu 51b by Mukkulankatu 51.
+    # - Find Mukkulankatu 51 by Mukkulankatu 51 B.
+    # - Only find Mukkulankatu 51 by Mukkulankatu 51.
+    # - Only find Mukkulankatu 51b by Mukkulankatu 51b.
+    if osoitenumerot_with_suffix:
+        osoitenumero_filter = or_(
+            # first, check if the letter is actually part of osoitenumero
+            Osoite.osoitenumero.in_(osoitenumerot_with_suffix),
+            # if the letter is not found in osoitenumero, it is huoneistotunnus
+            and_(
+                ~exists(Osoite.osoitenumero.in_(osoitenumerot_with_suffix)),
+                Osoite.osoitenumero.in_(osoitenumerot),
+            ),
+        )
+    else:
+        osoitenumero_filter = Osoite.osoitenumero.in_(osoitenumerot)
+    print(osoitenumero_filter)
+    # TODO: Do we need to check the kohde has vanhemmat with the correct
+    # huoneistotunnus?
+    # We do it when adding buildings to a new kohde in buildings.py.
+
+    filter = and_(
+        sqlalchemyFunc.lower(Osoite.posti_numero) == asiakas.haltija.osoite.postinumero,
+        or_(
+            sqlalchemyFunc.lower(Katu.katunimi_fi)
+            == asiakas.haltija.osoite.katunimi.lower(),
+            sqlalchemyFunc.lower(Katu.katunimi_sv)
+            == asiakas.haltija.osoite.katunimi.lower(),
+        ),
+        osoitenumero_filter,
+    )
+    print(filter)
+
+    return _find_kohde_by_asiakastiedot(session, filter, asiakas)
+
+
+def _find_kohde_by_asiakastiedot(
+    session: "Session", filter, asiakas: "Asiakas"
+) -> "Union[Kohde, None]":
+    # The same kohde may be client at multiple urakoitsijat and have multiple customer
+    # ids. Do *not* filter by missing/existing customer id.
+    print(filter)
     query = (
         select(Kohde.id, Osapuoli.nimi)
         .join(Kohde.rakennus_collection)
@@ -154,35 +188,62 @@ def find_kohde_by_asiakastiedot(
         .join(Osapuoli)
         .join(Osoite, isouter=True)
         .join(Katu, isouter=True)
-        .join(Kunta, isouter=True)
         .where(
-            ~ulkoinen_asiakastieto_exists,
             Kohde.voimassaolo.overlaps(
                 DateRange(
                     asiakas.voimassa.lower or datetime.date.min,
                     asiakas.voimassa.upper or datetime.date.max,
                 )
             ),
-            KohteenOsapuolet.osapuolenrooli
-            == codes.osapuolenroolit[OsapuolenrooliTyyppi.ASIAKAS],
-            or_(*filters),
+            # Any yhteystieto will do. The bill might not always go
+            # to the oldest person. It might be the owner.
+            # KohteenOsapuolet.osapuolenrooli
+            # == codes.osapuolenroolit[OsapuolenrooliTyyppi.ASIAKAS],
+            filter,
         )
         .distinct()
     )
+    print(query)
 
     try:
         kohteet = session.execute(query).all()
     except NoResultFound:
         return None
+    print(kohteet)
 
-    haltija_name_parts = set(asiakas.haltija.nimi.lower().split())
-    for kohde_id, db_asiakas_name in kohteet:
-        db_asiakas_name_parts = set(db_asiakas_name.lower().split())
-        if haltija_name_parts.issubset(
-            db_asiakas_name_parts
-        ) or db_asiakas_name_parts.issubset(haltija_name_parts):
-            kohde = session.get(Kohde, kohde_id)
-            return kohde
+    names_by_kohde_id = defaultdict(set)
+    for kohde_id, db_osapuoli_name in kohteet:
+        names_by_kohde_id[kohde_id].add(db_osapuoli_name)
+    if len(names_by_kohde_id) > 1:
+        # The address has multiple kohteet for the same date period.
+        # We may have
+        # 1) multiple perusmaksut for the same building (not paritalo),
+        # 2) paritalo,
+        # 3) multiple buildings in the same address (not paritalo),
+        # 4) multiple people moving in or out of the building in the same time period.
+        # Since we have no customer id here, we just have to check if the name is
+        # actually an osapuoli of an existing kohde or not. If not, we will return
+        # None and create a new kohde later. If an osapuoli exists, the new kohde may
+        # have been created from a kuljetus already.
+        print(
+            "Found multiple kohteet with the same address. Checking owners/inhabitants..."
+        )
+        haltija_nimi = clean_asoy_name(asiakas.haltija.nimi)
+        yhteystieto_nimi = clean_asoy_name(asiakas.yhteyshenkilo.nimi)
+        for kohde_id, db_osapuoli_names in names_by_kohde_id.items():
+            for db_osapuoli_name in db_osapuoli_names:
+                db_osapuoli_name = clean_asoy_name(db_osapuoli_name)
+                print(haltija_nimi)
+                print(db_osapuoli_name)
+                if match_name(haltija_nimi, db_osapuoli_name) or match_name(
+                    yhteystieto_nimi, db_osapuoli_name
+                ):
+                    print(f"{db_osapuoli_name} match")
+                    kohde = session.get(Kohde, kohde_id)
+                    print("returning kohde")
+                    return kohde
+    elif len(names_by_kohde_id) == 1:
+        return session.get(Kohde, next(iter(names_by_kohde_id.keys())))
 
     return None
 
@@ -267,28 +328,32 @@ def create_new_kohde(session: "Session", asiakas: "Asiakas"):
 def create_new_kohde_from_buildings(
     session: "Session",
     rakennus_ids: "List[int]",
-    asiakkaat: "List[Osapuoli]",
+    asiakkaat: "Set[Osapuoli]",
+    yhteystiedot: "Set[Osapuoli]",
+    alkupvm: "Optional[str]",
+    loppupvm: "Optional[str]",
 ):
     """
     Create combined kohde for the given list of building ids. Asiakkaat will be
-    used for kohde name and contact info.
+    used for kohde name and osapuoli. Yhteystiedot will be added as additional contacts
+    for kohde, i.e. they are additional inhabitants and/or owners.
     """
     # prefer companies over private owners when naming combined objects
-    asoy_asiakkaat = [osapuoli for osapuoli in asiakkaat if is_asoy(osapuoli.nimi)]
-    company_asiakkaat = [
+    asoy_asiakkaat = {osapuoli for osapuoli in asiakkaat if is_asoy(osapuoli.nimi)}
+    company_asiakkaat = {
         osapuoli for osapuoli in asiakkaat if is_company(osapuoli.nimi)
-    ]
-    yhteiso_asiakkaat = [
+    }
+    yhteiso_asiakkaat = {
         osapuoli for osapuoli in asiakkaat if is_yhteiso(osapuoli.nimi)
-    ]
+    }
     if asoy_asiakkaat:
-        asiakas = asoy_asiakkaat[0]
+        asiakas = next(iter(asoy_asiakkaat))
     elif company_asiakkaat:
-        asiakas = company_asiakkaat[0]
+        asiakas = next(iter(company_asiakkaat))
     elif yhteiso_asiakkaat:
-        asiakas = yhteiso_asiakkaat[0]
+        asiakas = next(iter(yhteiso_asiakkaat))
     else:
-        asiakas = asiakkaat[0]
+        asiakas = next(iter(asiakkaat))
     kohde_display_name = form_display_name(
         Yhteystieto(
             asiakas.nimi,
@@ -300,7 +365,8 @@ def create_new_kohde_from_buildings(
     kohde = Kohde(
         nimi=kohde_display_name,
         kohdetyyppi=codes.kohdetyypit[KohdeTyyppi.KIINTEISTO],
-        alkupvm=datetime.date.today(),
+        alkupvm=alkupvm,
+        loppupvm=loppupvm,
     )
     session.add(kohde)
     # we need to get the id for the kohde from db
@@ -319,10 +385,23 @@ def create_new_kohde_from_buildings(
             osapuolenrooli=codes.osapuolenroolit[OsapuolenrooliTyyppi.ASIAKAS],
         )
         session.add(asiakas)
+    # yhteystiedot should not duplicate asiakas data
+    for osapuoli in yhteystiedot - asiakkaat:
+        yhteystieto = KohteenOsapuolet(
+            osapuoli_id=osapuoli.id,
+            kohde_id=kohde.id,
+            osapuolenrooli=codes.osapuolenroolit[OsapuolenrooliTyyppi.YHTEYSTIETO],
+        )
+        session.add(yhteystieto)
     return kohde
 
 
-def create_kohteet_from_vanhimmat(session: "Session", ids: "Select"):
+def create_kohteet_from_vanhimmat(
+    session: "Session",
+    ids: "Select",
+    alkupvm: "Optional[str]",
+    loppupvm: "Optional[str]",
+):
     """
     Create one kohde for each RakennuksenVanhimmat osapuoli id provided by
     the select query.
@@ -337,9 +416,17 @@ def create_kohteet_from_vanhimmat(session: "Session", ids: "Select"):
     print(f"Found {len(vanhimmat_osapuolet)} vanhimmat without kohde")
     kohteet = []
     for (vanhin, osapuoli) in vanhimmat_osapuolet:
-        # the oldest inhabitant is the customer
+        # The oldest inhabitant is the customer. Also save owners as backup
+        # contacts.
+        omistajat_query = (
+            select(RakennuksenOmistajat, Osapuoli)
+            .join(RakennuksenOmistajat.osapuoli)
+            .where(RakennuksenOmistajat.rakennus_id == vanhin.rakennus_id)
+        )
+        omistajat = {row[1] for row in session.execute(omistajat_query).all()}
+        print(f"Building {vanhin.rakennus_id} has owners {omistajat}")
         kohde = create_new_kohde_from_buildings(
-            session, [vanhin.rakennus_id], [osapuoli]
+            session, [vanhin.rakennus_id], {osapuoli}, omistajat, alkupvm, loppupvm
         )
         kohteet.append(kohde)
     return kohteet
@@ -468,12 +555,15 @@ def _add_auxiliary_buildings(
 def create_kohteet_from_kiinteisto(
     session: "Session",
     kiinteistotunnukset: "Select",
-    customer_table: "DeclarativeMeta" = None,
+    alkupvm: "Optional[str]",
+    loppupvm: "Optional[str]",
+    customer_table: "Optional[DeclarativeMeta]",
 ):
     """
     Create at least one kohde from each kiinteistotunnus provided by the select query.
     Customer_table is the optional additional table to use for customer id. By default,
-    each kohde will have building owner as its customer.
+    each kohde will have all owners as its customer. In this case, owners will be added
+    as additional contacts.
 
     If the same kiinteistotunnus has buildings with multiple owners,
     first kohde will contain all buildings owned by the owner with the most buildings.
@@ -587,6 +677,14 @@ def create_kohteet_from_kiinteisto(
                 (street, number), buildings_at_address = addresses_by_buildings[0]
                 print(f"Processing street {street} osoitenumero {number}")
                 print(f"with buildings {buildings_at_address}")
+                # Add all owners as contact info
+                owners = {
+                    owner
+                    for owner, buildings in buildings_by_owner.items()
+                    if buildings & buildings_at_address
+                }
+                print(f"Address has owners {owners}")
+
                 # Customer may be the owner or the inhabitant.
                 customer = None
                 if customer_table:
@@ -607,7 +705,12 @@ def create_kohteet_from_kiinteisto(
                     customer = first_owner
                 print(f"Creating kohde {customer}: {buildings_at_address}")
                 kohde = create_new_kohde_from_buildings(
-                    session, list(buildings_at_address), [customer]
+                    session,
+                    list(buildings_at_address),
+                    {customer},
+                    owners,
+                    alkupvm,
+                    loppupvm,
                 )
                 # do not import the building again from second address
                 buildings_owned -= buildings_at_address
@@ -616,7 +719,11 @@ def create_kohteet_from_kiinteisto(
     return kohteet
 
 
-def create_single_asunto_kohteet(session: "Session") -> "List(Kohde)":
+def create_single_asunto_kohteet(
+    session: "Session",
+    alkupvm: "Optional[str]",
+    loppupvm: "Optional[str]",
+) -> "List(Kohde)":
     """
     Create kohteet from all yksittäistalot that do not have kohde. Also consider
     yksittäistalot that do not have an inhabitant.
@@ -651,11 +758,15 @@ def create_single_asunto_kohteet(session: "Session") -> "List(Kohde)":
     # same owner. Separate owners will get separate kohde, OR
     # TODO: optionally, do not create separate kohteet after all??
     return create_kohteet_from_kiinteisto(
-        session, single_asunto_kiinteistotunnus, RakennuksenVanhimmat
+        session, single_asunto_kiinteistotunnus, alkupvm, loppupvm, RakennuksenVanhimmat
     )
 
 
-def create_paritalo_kohteet(session: "Session") -> "List(Kohde)":
+def create_paritalo_kohteet(
+    session: "Session",
+    alkupvm: "Optional[str]",
+    loppupvm: "Optional[str]",
+) -> "List(Kohde)":
     """
     Create kohteet from all paritalo buildings that do not have kohde.
     """
@@ -679,10 +790,12 @@ def create_paritalo_kohteet(session: "Session") -> "List(Kohde)":
     print("Creating paritalokohteet...")
     # TODO: instead, merge all empty buildings on kiinteistö to the main building
     # Where to merge? We have two identical owners. Better not merge at all?
-    return create_kohteet_from_vanhimmat(session, vanhimmat_ids)
+    return create_kohteet_from_vanhimmat(session, vanhimmat_ids, alkupvm, loppupvm)
 
 
-def create_multiple_and_uninhabited_kohteet(session: "Session") -> "List(Kohde)":
+def create_multiple_and_uninhabited_kohteet(
+    session: "Session", alkupvm: "Optional[str]", loppupvm: "Optional[str]"
+) -> "List(Kohde)":
     """
     Create kohteet from all kiinteistötunnus that do not have kohde.
     """
@@ -706,7 +819,9 @@ def create_multiple_and_uninhabited_kohteet(session: "Session") -> "List(Kohde)"
     # Merge all empty buildings with same owner to the main building.
     # Separate owners will get separate kohde, OR
     # TODO: optionally, do not create separate kohteet after all??
-    return create_kohteet_from_kiinteisto(session, kiinteistotunnus_without_kohde)
+    return create_kohteet_from_kiinteisto(
+        session, kiinteistotunnus_without_kohde, alkupvm, loppupvm, None
+    )
 
 
 def _should_have_perusmaksu_kohde(rakennus: "Rakennus"):
@@ -726,7 +841,12 @@ def _should_have_perusmaksu_kohde(rakennus: "Rakennus"):
     )
 
 
-def create_perusmaksurekisteri_kohteet(session: "Session", perusmaksutiedosto: "Path"):
+def create_perusmaksurekisteri_kohteet(
+    session: "Session",
+    perusmaksutiedosto: "Path",
+    alkupvm: "Optional[str]",
+    loppupvm: "Optional[str]",
+):
     """
     Create kohteet combining all dvv buildings that have the same asiakasnumero in
     perusmaksurekisteri and have the desired type. No need to import anything from
@@ -806,12 +926,10 @@ def create_perusmaksurekisteri_kohteet(session: "Session", perusmaksutiedosto: "
         # We have no idea who should pay, and the buildings do not always
         # have common owners at all.
         owner_sets = [rakennustiedot[1] for rakennustiedot in building_set]
-        owners = list(set().union(*owner_sets))
+        owners = set().union(*owner_sets)
         print(f"Having owners {owners}")
         kohde = create_new_kohde_from_buildings(
-            session,
-            rakennus_ids,
-            owners,
+            session, rakennus_ids, owners, owners, alkupvm, loppupvm
         )
         kohteet.append(kohde)
     return kohteet
