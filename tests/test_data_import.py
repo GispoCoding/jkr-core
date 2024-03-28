@@ -128,7 +128,7 @@ def test_update_dvv_kohteet(engine):
 
     # Päättyneelle kohteelle Kemp asetettu loppupäivämäärä
     kohde_nimi_filter = Kohde.nimi == 'Kemp'
-    loppu_pvm_filter = Kohde.loppupvm == func.to_date('2023-01-30', 'YYYY-MM-DD')
+    loppu_pvm_filter = Kohde.loppupvm == func.to_date('2023-01-16', 'YYYY-MM-DD')
     kohde_id = session.query(Kohde.id).filter(kohde_nimi_filter).filter(loppu_pvm_filter).scalar()
     assert kohde_id is not None
 
@@ -137,7 +137,7 @@ def test_update_dvv_kohteet(engine):
     assert session.query(func.count(Kohde.id)).filter(loppu_pvm_filter).scalar() == 2
 
     # Uudessa kohteessa Kyykoski osapuolina Granström (omistaja) ja Kyykoski (uusi asukas)
-    kohde_filter = and_(Kohde.nimi == 'Kyykoski', Kohde.alkupvm == '2023-01-31')
+    kohde_filter = and_(Kohde.nimi == 'Kyykoski', Kohde.alkupvm == '2023-01-17')
     kohde_id = session.execute(select(Kohde.id).where(kohde_filter)).fetchone()[0]
     osapuoli_filter = or_(Osapuoli.nimi.like('Granström%'), Osapuoli.nimi.like('Kyykoski%'))
     osapuoli_ids = \
