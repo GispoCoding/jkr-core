@@ -101,6 +101,18 @@ def test_import_dvv_kohteet(engine, datadir):
     assert session.query(func.count(KohteenOsapuolet.kohde_id)).filter(vanhin_asukas_filter).scalar() == 3
 
 
+def _assert_kohteen_loppupvm(session, pvmstr, nimi):
+    kohde_nimi_filter = Kohde.nimi == nimi
+    loppu_pvm_filter = Kohde.loppupvm == func.to_date(pvmstr, "YYYY-MM-DD")
+    kohde_id = (
+        session.query(Kohde.id)
+        .filter(kohde_nimi_filter)
+        .filter(loppu_pvm_filter)
+        .scalar()
+    )
+    assert kohde_id is not None
+
+
 def test_update_dvv_kohteet(engine):
     # Updating the test database created before test fixtures
     update_test_db_command = ".\\scripts\\update_database.bat"
@@ -121,22 +133,13 @@ def test_update_dvv_kohteet(engine):
     assert session.query(func.count(Kohde.id)).scalar() == 9
 
     # Perusmaksurekisteristä luodun kohteen Asunto Oy Kahden Laulumuisto loppupäivämäärä ei ole muuttunut
-    kohde_nimi_filter = Kohde.nimi == 'Asunto Oy Kahden Laulumuisto'
-    loppu_pvm_filter = Kohde.loppupvm == func.to_date('2100-01-01', 'YYYY-MM-DD')
-    kohde_id = session.query(Kohde.id).filter(kohde_nimi_filter).filter(loppu_pvm_filter).scalar()
-    assert kohde_id is not None
+    _assert_kohteen_loppupvm(session, '2100-01-01', 'Asunto Oy Kahden Laulumuisto')
 
     # Päättyneelle kohteelle Kemp (asukas vaihtunut) asetettu loppupäivämäärä oikein
-    kohde_nimi_filter = Kohde.nimi == 'Kemp'
-    loppu_pvm_filter = Kohde.loppupvm == func.to_date('2023-01-16', 'YYYY-MM-DD')
-    kohde_id = session.query(Kohde.id).filter(kohde_nimi_filter).filter(loppu_pvm_filter).scalar()
-    assert kohde_id is not None
+    _assert_kohteen_loppupvm(session, '2023-01-16', 'Kemp')
 
     # Päättyneelle kohteelle Pohjonen (omistaja vaihtunut) asetettu loppupäivämäärä oikein
-    kohde_nimi_filter = Kohde.nimi == 'Pohjonen'
-    loppu_pvm_filter = Kohde.loppupvm == func.to_date('2023-01-22', 'YYYY-MM-DD')
-    kohde_id = session.query(Kohde.id).filter(kohde_nimi_filter).filter(loppu_pvm_filter).scalar()
-    assert kohde_id is not None
+    _assert_kohteen_loppupvm(session, '2023-01-22', 'Pohjonen')
 
     # Muilla kohteilla ei loppupäivämäärää
     loppu_pvm_filter = Kohde.loppupvm != None
