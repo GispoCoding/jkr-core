@@ -7,9 +7,8 @@ from typing import TYPE_CHECKING
 
 from openpyxl import load_workbook
 from psycopg2.extras import DateRange
-from sqlalchemy import and_, exists
+from sqlalchemy import and_, exists, or_, select, update
 from sqlalchemy import func as sqlalchemyFunc
-from sqlalchemy import or_, select
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.orm.decl_api import DeclarativeMeta
 
@@ -828,6 +827,29 @@ def create_new_kohde(session: "Session", asiakas: "Asiakas"):
     return kohde
 
 
+def parse_alkupvm_for_kohde(
+    session: "Session",
+    rakennus_ids: "List[int]",
+    poimintapvm: "Optional[datetime.date]",
+):
+    latest_omistaja_change = (
+        session.query(sqlalchemyFunc.max(RakennuksenOmistajat.omistuksen_alkupvm))
+        .filter(RakennuksenOmistajat.rakennus_id.in_(rakennus_ids))
+        .scalar()
+    )
+    latest_vanhin_change = session.query(
+        sqlalchemyFunc.max(RakennuksenVanhimmat.alkupvm)
+    ).filter(RakennuksenVanhimmat.rakennus_id.in_(rakennus_ids)).scalar()
+
+    if latest_omistaja_change is None and latest_vanhin_change is None:
+        return poimintapvm
+    if latest_omistaja_change is None and latest_vanhin_change is not None:
+        return latest_vanhin_change
+    if latest_vanhin_change is None and latest_omistaja_change is not None:
+        return latest_omistaja_change
+    return max(latest_omistaja_change, latest_vanhin_change)
+
+
 def create_new_kohde_from_buildings(
     session: "Session",
     rakennus_ids: "List[int]",
@@ -875,10 +897,11 @@ def create_new_kohde_from_buildings(
         )
     else:
         kohde_display_name = "Tuntematon"
+    alkupvm = parse_alkupvm_for_kohde(session, rakennus_ids, poimintapvm)
     kohde = Kohde(
         nimi=kohde_display_name,
         kohdetyyppi=codes.kohdetyypit[KohdeTyyppi.KIINTEISTO],
-        alkupvm=poimintapvm,
+        alkupvm=alkupvm,
         loppupvm=loppupvm,
     )
     session.add(kohde)
@@ -911,6 +934,30 @@ def create_new_kohde_from_buildings(
         )
         session.add(yhteystieto)
     return kohde
+
+
+def old_kohde_id_for_buildings(
+    session: "Session", rakennus_ids: "List[int]", poimintapvm: "datetime.date"
+):
+    kohde_query = (
+        select(Kohde.id)
+        .join(KohteenRakennukset)
+        .filter(
+            KohteenRakennukset.rakennus_id.in_(rakennus_ids),
+            Kohde.loppupvm == poimintapvm - timedelta(days=1),
+        )
+    )
+    old_kohde_id = session.execute(kohde_query).scalar()
+    return old_kohde_id
+
+
+def set_old_kohde_loppupvm(session: "Session", kohde_id: int, loppupvm: "datetime.date"):
+    session.execute(
+        update(Kohde)
+        .where(Kohde.id == kohde_id)
+        .values(loppupvm=loppupvm)
+    )
+    session.commit()
 
 
 def update_or_create_kohde_from_buildings(
@@ -1025,9 +1072,15 @@ def update_or_create_kohde_from_buildings(
         # All combinations are checked above.
     else:
         print("Sopivaa kohdetta ei löydy, luodaan uusi kohde.")
-        return create_new_kohde_from_buildings(
+        new_kohde = create_new_kohde_from_buildings(
             session, rakennus_ids, asukkaat, omistajat, poimintapvm, loppupvm
         )
+        if new_kohde and poimintapvm:
+            old_kohde_id = old_kohde_id_for_buildings(session, rakennus_ids, poimintapvm)
+            if old_kohde_id:
+                print(f"Löytyi päättyvä kohde {old_kohde_id}, asetetaan loppupäivämäärä.")
+                set_old_kohde_loppupvm(session, old_kohde_id, new_kohde.alkupvm - timedelta(days=1))
+        return new_kohde
 
     # Return existing kohde when found
     print("Olemassaoleva kohde löytynyt.")
