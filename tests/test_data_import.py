@@ -69,7 +69,7 @@ def test_import_dvv_kohteet(engine, datadir):
         print(f"Creating kohteet failed: {e}")
 
     # Kohteiden lkm
-    assert session.query(func.count(Kohde.id)).scalar() == 5
+    assert session.query(func.count(Kohde.id)).scalar() == 6
 
     # Perusmaksurekisteristä luodulla kohteella Asunto Oy Kahden Laulumuisto on loppupäivämäärä
     kohde_nimi_filter = Kohde.nimi == 'Asunto Oy Kahden Laulumuisto'
@@ -118,7 +118,7 @@ def test_update_dvv_kohteet(engine):
         print(f"Updating kohteet failed: {e}")
 
     # Kohteiden lkm
-    assert session.query(func.count(Kohde.id)).scalar() == 7
+    assert session.query(func.count(Kohde.id)).scalar() == 9
 
     # Perusmaksurekisteristä luodun kohteen Asunto Oy Kahden Laulumuisto loppupäivämäärä ei ole muuttunut
     kohde_nimi_filter = Kohde.nimi == 'Asunto Oy Kahden Laulumuisto'
@@ -126,15 +126,21 @@ def test_update_dvv_kohteet(engine):
     kohde_id = session.query(Kohde.id).filter(kohde_nimi_filter).filter(loppu_pvm_filter).scalar()
     assert kohde_id is not None
 
-    # Päättyneelle kohteelle Kemp asetettu loppupäivämäärä
+    # Päättyneelle kohteelle Kemp (asukas vaihtunut) asetettu loppupäivämäärä oikein
     kohde_nimi_filter = Kohde.nimi == 'Kemp'
     loppu_pvm_filter = Kohde.loppupvm == func.to_date('2023-01-16', 'YYYY-MM-DD')
     kohde_id = session.query(Kohde.id).filter(kohde_nimi_filter).filter(loppu_pvm_filter).scalar()
     assert kohde_id is not None
 
+    # Päättyneelle kohteelle Pohjonen (omistaja vaihtunut) asetettu loppupäivämäärä oikein
+    kohde_nimi_filter = Kohde.nimi == 'Pohjonen'
+    loppu_pvm_filter = Kohde.loppupvm == func.to_date('2023-01-22', 'YYYY-MM-DD')
+    kohde_id = session.query(Kohde.id).filter(kohde_nimi_filter).filter(loppu_pvm_filter).scalar()
+    assert kohde_id is not None
+
     # Muilla kohteilla ei loppupäivämäärää
     loppu_pvm_filter = Kohde.loppupvm != None
-    assert session.query(func.count(Kohde.id)).filter(loppu_pvm_filter).scalar() == 2
+    assert session.query(func.count(Kohde.id)).filter(loppu_pvm_filter).scalar() == 3
 
     # Uudessa kohteessa Kyykoski osapuolina Granström (omistaja) ja Kyykoski (uusi asukas)
     kohde_filter = and_(Kohde.nimi == 'Kyykoski', Kohde.alkupvm == '2023-01-17')
